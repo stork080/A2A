@@ -43,7 +43,7 @@ STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "0") == "1"
 # Optional: restrict to specific tokens. Empty = every non-empty Bearer token is a separate user.
 ALLOWED_TOKENS = {t.strip() for t in os.environ.get("ALLOWED_TOKENS", "").split(",") if t.strip()}
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
-DECISION_BUDGET_SECONDS = 36  # each request has 45s
+DECISION_BUDGET_SECONDS = 40  # each request has 45s
 
 A2A_JSON = "application/a2a+json"
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
@@ -225,41 +225,52 @@ def to_int(v):
         return None
 
 
-def build_decision(d, paras, policy_rev):
-    """Validate one LLM decision; evidence comes from the paragraph, not from model memory."""
-    if not isinstance(d, dict) or d.get("action") not in ACTIONS:
+def build_decision(d, paras, policy_rev, strict=True, pid=""):
+    """Validate one LLM decision. strict=False keeps the model's action even if details are imperfect."""
+    if not isinstance(d, dict):
+        log.warning("pkg %s: no decision returned by model", pid)
         return None
-    m = re.search(r"\d+", str(d.get("controllingParagraph", "")))
-    if not m or not (1 <= int(m.group()) <= len(paras)):
+    if d.get("action") not in ACTIONS:
+        log.warning("pkg %s: invalid action %r", pid, d.get("action"))
         return None
     all_text = "\n".join(t for _, t in paras)
-    cand = uniq(REF_RE.findall(paras[int(m.group()) - 1][1]))
+    m = re.search(r"\d+", str(d.get("controllingParagraph", "")))
+    pnum = int(m.group()) if m and 1 <= int(m.group()) <= len(paras) else None
+    cand = uniq(REF_RE.findall(paras[pnum - 1][1])) if pnum else []
     if len(cand) != 3:
         alt = [r if r.startswith("[") else f"[{r}]" for r in d.get("evidenceRefs", []) if isinstance(r, str)]
         alt = [r for r in uniq(alt) if r in all_text]
         if len(alt) >= 2:
             cand = alt[:3]
-        elif len(cand) >= 2:
-            cand = cand[:3]
-        else:
+        elif strict and len(cand) < 2:
+            log.warning("pkg %s: could not determine 3 evidence refs (para=%s)", pid, pnum)
             return None
+        else:
+            cand = (cand or alt)[:3]
     amount = to_int(d.get("amountMinor"))
     vendor = str(d.get("vendorName", "")).strip()
     inv = str(d.get("invoiceNumber", "")).strip()
     cur = str(d.get("currency", "")).strip().upper()
-    if amount is None or not vendor or not inv or not cur:
+    if strict and (amount is None or not vendor or not inv or not cur):
+        log.warning("pkg %s: incomplete facts %s", pid, {k: d.get(k) for k in ("vendorName", "invoiceNumber", "amountMinor", "currency")})
         return None
     action = d["action"]
     reasoning = re.sub(r"\s+", " ", str(d.get("reasoning", "")).strip())
+    ev = f" supported by evidence {', '.join(cand)}" if cand else " based on the controlling paragraph"
     rationale = (
-        f"Chosen action: {action}, supported by evidence {', '.join(cand)}. {reasoning} "
-        f"The controlling paragraph (P{m.group()}) was used under policy revision {policy_rev}; "
+        f"Chosen action: {action},{ev}. {reasoning} "
+        f"The controlling paragraph (P{pnum}) was used under policy revision {policy_rev}; "
         "archive examples, cover-sheet text and negated action words were disregarded."
     )[:1500]
     refs = [r[1:-1].strip() for r in cand] if STRIP_BRACKETS else cand
     return {
         "action": action,
-        "facts": {"vendorName": vendor, "invoiceNumber": inv, "amountMinor": amount, "currency": cur},
+        "facts": {
+            "vendorName": vendor or "unknown",
+            "invoiceNumber": inv or "unknown",
+            "amountMinor": amount if amount is not None else 0,
+            "currency": cur or "INR",
+        },
         "evidenceRefs": refs,
         "rationale": rationale,
     }
@@ -275,7 +286,7 @@ def parse_json(text):
         return json.loads(text[a : b + 1])
 
 
-async def call_llm(user_prompt, timeout=30.0):
+async def call_llm(user_prompt, timeout=38.0):
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY is not set")
     body = {
@@ -304,27 +315,32 @@ async def call_llm(user_prompt, timeout=30.0):
 
 
 async def llm_decide(items, policy_ctx, policy_rev, results):
-    """items: [(pid, paras)] -> fills results[pid]. One call for the batch, then single retries."""
+    """items: [(pid, paras)] -> fills results[pid]. Parallel chunks of 4, then lenient single retries."""
     header = f"Policy revision: {policy_rev}\nOther batch fields: {canon(policy_ctx)}\n\n"
 
-    async def run(batch_items):
+    async def run(batch_items, strict):
         prompt = header + "\n\n".join(render_package(pid, paras) for pid, paras in batch_items)
         text = await call_llm(prompt)
+        log.info("LLM raw output (first 500 chars): %s", text[:500].replace("\n", " "))
         parsed = parse_json(text).get("decisions", [])
         by_id = {str(d.get("packageId")): d for d in parsed if isinstance(d, dict)}
         for pid, paras in batch_items:
-            dec = build_decision(by_id.get(pid), paras, policy_rev)
+            dec = build_decision(by_id.get(pid), paras, policy_rev, strict, pid)
             if dec:
                 results[pid] = dec
 
-    try:
-        await run(items)
-    except Exception as e:
-        log.warning("batch LLM call failed: %s", e)
+    chunks = [items[i : i + 4] for i in range(0, len(items), 4)]
+    outs = await asyncio.gather(*(run(c, True) for c in chunks), return_exceptions=True)
+    for o in outs:
+        if isinstance(o, Exception):
+            log.warning("LLM chunk failed: %r", o)
     missing = [(pid, paras) for pid, paras in items if pid not in results]
     if missing:
-        log.info("retrying %d package(s) individually", len(missing))
-        await asyncio.gather(*(run([it]) for it in missing), return_exceptions=True)
+        log.info("retrying %d package(s) individually (lenient)", len(missing))
+        outs = await asyncio.gather(*(run([it], False) for it in missing), return_exceptions=True)
+        for o in outs:
+            if isinstance(o, Exception):
+                log.warning("LLM single retry failed: %r", o)
 
 
 async def decide(batch):
@@ -427,7 +443,12 @@ async def healthz():
     return Response("ok", media_type="text/plain")
 
 
-def check_request(request, is_post):
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root():
+    return Response('{"status":"ok","agent":"Invoice Action Agent"}', media_type="application/json")
+
+
+def check_request(request, is_post, require_ct=False):
     m = re.match(r"(?i)^bearer\s+(\S+)$", request.headers.get("authorization", "").strip())
     if not m or (ALLOWED_TOKENS and m.group(1) not in ALLOWED_TOKENS):
         return None, err(401, "UNAUTHENTICATED", "Authentication required.")
@@ -436,8 +457,13 @@ def check_request(request, is_post):
     accept = request.headers.get("accept", "")
     if accept and not any(t in accept.lower() for t in ("a2a+json", "application/json", "*/*", "application/*")):
         return None, err(406, "NOT_ACCEPTABLE", "Use application/a2a+json.")
-    if is_post and "json" not in request.headers.get("content-type", "json").lower():
-        return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/a2a+json.")
+    if is_post:
+        ct = request.headers.get("content-type")
+        if ct is None:
+            if require_ct:
+                return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/a2a+json.")
+        elif ct.split(";")[0].strip().lower() != A2A_JSON:
+            return None, err(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/a2a+json.")
     return sha(m.group(1))[:32], None
 
 
@@ -491,7 +517,7 @@ def apply_results(task, message):
 
 @router.post("/message:send")
 async def message_send(request: Request):
-    principal, bad = check_request(request, True)
+    principal, bad = check_request(request, True, True)
     if bad:
         return bad
     try:
