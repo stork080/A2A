@@ -49,7 +49,8 @@ STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "0") == "1"
 # Optional: restrict to specific tokens. Empty = every non-empty Bearer token is a separate user.
 ALLOWED_TOKENS = {t.strip() for t in os.environ.get("ALLOWED_TOKENS", "").split(",") if t.strip()}
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
-DECISION_BUDGET_SECONDS = 40  # each request has 45s
+DECISION_BUDGET_SECONDS = 40
+LLM_CHUNK = max(1, int(os.environ.get("LLM_CHUNK", "6") or 6))  # packages per model call  # each request has 45s
 
 A2A_JSON = "application/a2a+json"
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
@@ -307,13 +308,13 @@ async def call_llm(user_prompt, timeout=38.0):
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(2):
+        for attempt in range(4):
             r = await client.post(url, json=body, headers=headers)
             if r.status_code == 400 and "response_format" in body:
                 body.pop("response_format")
                 continue
-            if r.status_code == 429 and attempt == 0:
-                await asyncio.sleep(2)
+            if r.status_code in (429, 500, 502, 503) and attempt < 3:
+                await asyncio.sleep(3 * (attempt + 1))  # 3s, 6s, 9s backoff
                 continue
             if r.status_code >= 400:
                 raise RuntimeError(f"LLM HTTP {r.status_code} from {url} model={LLM_MODEL}: {r.text[:300]}")
@@ -336,7 +337,7 @@ async def llm_decide(items, policy_ctx, policy_rev, results):
             if dec:
                 results[pid] = dec
 
-    chunks = [items[i : i + 4] for i in range(0, len(items), 4)]
+    chunks = [items[i : i + LLM_CHUNK] for i in range(0, len(items), LLM_CHUNK)]
     outs = await asyncio.gather(*(run(c, True) for c in chunks), return_exceptions=True)
     for o in outs:
         if isinstance(o, Exception):
