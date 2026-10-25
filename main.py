@@ -32,11 +32,17 @@ log = logging.getLogger("agent")
 # --------------------------------------------------------------------------
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()  # EXACT url you submit
 BASE_PATH = urlparse(PUBLIC_BASE_URL).path.rstrip("/") if PUBLIC_BASE_URL else ""
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get(
-    "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip().strip("\"'")
+LLM_BASE_URL = (
+    os.environ.get("LLM_BASE_URL", "").strip().strip("\"'")
+    or "https://generativelanguage.googleapis.com/v1beta/openai"
 )
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+if not LLM_BASE_URL.lower().startswith(("http://", "https://")):
+    LLM_BASE_URL = "https://" + LLM_BASE_URL
+LLM_BASE_URL = LLM_BASE_URL.rstrip("/")
+if LLM_BASE_URL.endswith("/chat/completions"):
+    LLM_BASE_URL = LLM_BASE_URL[: -len("/chat/completions")]
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip().strip("\"'") or "gemini-2.5-flash"
 # 0 = return evidence refs exactly as written, brackets included, e.g. "[PO-123]"
 # 1 = strip the brackets, e.g. "PO-123"   (flip this if evidence checks fail)
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "0") == "1"
@@ -288,7 +294,7 @@ def parse_json(text):
 
 async def call_llm(user_prompt, timeout=38.0):
     if not LLM_API_KEY:
-        raise RuntimeError("LLM_API_KEY is not set")
+        raise RuntimeError("LLM_API_KEY is not set (check Render > Environment)")
     body = {
         "model": LLM_MODEL,
         "temperature": 0,
@@ -309,9 +315,10 @@ async def call_llm(user_prompt, timeout=38.0):
             if r.status_code == 429 and attempt == 0:
                 await asyncio.sleep(2)
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise RuntimeError(f"LLM HTTP {r.status_code} from {url} model={LLM_MODEL}: {r.text[:300]}")
             return r.json()["choices"][0]["message"]["content"]
-        r.raise_for_status()
+        raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:300]}")
 
 
 async def llm_decide(items, policy_ctx, policy_rev, results):
